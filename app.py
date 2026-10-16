@@ -1,8 +1,15 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
+from auth import (
+    CurrentUser,
+    get_current_user,
+    invite_member,
+    sign_in,
+    sign_up_admin,
+)
 from actions import (
     claim_action,
     mark_action_failed,
@@ -40,6 +47,101 @@ class ChatRequest(BaseModel):
 class ActionDecisionRequest(BaseModel):
     user_id: str
     user_role: str
+
+
+class AdminSignupRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    phone: str
+    institute_name: str
+    institute_address: str | None = None
+    institute_phone: str | None = None
+    institute_email: str | None = None
+
+
+class MemberInvitationRequest(BaseModel):
+    email: str
+    full_name: str
+    phone: str
+    expertise: str | None = None
+
+
+class SigninRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/auth/signup/admin")
+async def signup_admin(request: AdminSignupRequest):
+    return sign_up_admin(
+        email=request.email,
+        password=request.password,
+        full_name=request.full_name,
+        phone=request.phone,
+        institute_name=request.institute_name,
+        institute_address=request.institute_address,
+        institute_phone=request.institute_phone,
+        institute_email=request.institute_email,
+    )
+
+
+@app.post("/api/auth/signin")
+async def signin(request: SigninRequest):
+    return sign_in(request.email, request.password)
+
+
+@app.post("/api/admin/invitations/student")
+async def invite_student(
+    request: MemberInvitationRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only institute administrators can invite students.",
+        )
+    return invite_member(
+        email=request.email,
+        full_name=request.full_name,
+        phone=request.phone,
+        institute_id=user.institute_id,
+        role="STUDENT",
+    )
+
+
+@app.post("/api/admin/invitations/tutor")
+async def invite_tutor(
+    request: MemberInvitationRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only institute administrators can invite tutors.",
+        )
+    return invite_member(
+        email=request.email,
+        full_name=request.full_name,
+        phone=request.phone,
+        expertise=request.expertise,
+        institute_id=user.institute_id,
+        role="TRAINER",
+    )
+
+
+@app.get("/api/auth/me")
+async def current_user(
+    user: CurrentUser = Depends(get_current_user),
+):
+    return {
+        "auth_user_id": user.auth_user_id,
+        "email": user.email,
+        "institute_id": user.institute_id,
+        "role": user.role,
+        "student_id": user.student_id,
+        "trainer_id": user.trainer_id,
+    }
 
 
 @app.post("/api/copilot/chat")

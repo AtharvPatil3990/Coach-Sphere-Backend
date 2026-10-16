@@ -1,0 +1,28 @@
+# .gitignore
+
+# Security (NEVER commit this)
+.env
+.env.local
+secrets.json
+
+# Python Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Caches & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Supabase Local CLI (If you use it later)
+supabase/.temp/

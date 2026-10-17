@@ -1,10 +1,11 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import date, time
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from auth import (
     CurrentUser,
@@ -20,7 +21,7 @@ from actions import (
     reject_action,
 )
 from copilot_engine import CopilotEngine
-from database import initialize_action_store
+from database import get_connection, initialize_action_store
 from messaging import send_messages
 
 
@@ -92,6 +93,42 @@ class SigninRequest(BaseModel):
     password: str
 
 
+class BranchCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    address: str | None = None
+    phone: str | None = None
+
+
+class CourseCreateRequest(BaseModel):
+    course_code: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=200)
+    duration_weeks: int = Field(gt=0)
+    base_fee: float = Field(ge=0)
+
+
+class BatchCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    course_id: str
+    trainer_id: str | None = None
+    mode: str
+    room_number: str | None = None
+    meeting_url: str | None = None
+    max_classroom_seats: int = Field(default=30, gt=0)
+    max_online_seats: int = Field(default=100, gt=0)
+    start_date: date
+    end_date: date | None = None
+    schedule_time: time
+    status: str = "ACTIVE"
+
+
+def require_admin(user: CurrentUser) -> None:
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only institute administrators can perform this operation.",
+        )
+
+
 @app.post("/api/auth/signup/admin")
 async def signup_admin(request: AdminSignupRequest):
     return sign_up_admin(
@@ -109,6 +146,173 @@ async def signup_admin(request: AdminSignupRequest):
 @app.post("/api/auth/signin")
 async def signin(request: SigninRequest):
     return sign_in(request.email, request.password)
+
+
+@app.post("/api/admin/branches")
+async def create_branch(
+    request: BranchCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.branches (
+                        institute_id, name, address, phone
+                    )
+                    VALUES (%s::uuid, %s, %s, %s)
+                    RETURNING id::text, institute_id::text, name,
+                              address, phone, is_active, created_at
+                    """,
+                    (
+                        user.institute_id,
+                        request.name.strip(),
+                        request.address,
+                        request.phone,
+                    ),
+                )
+                branch = cursor.fetchone()
+        return {"branch": dict(branch)}
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create the branch. The name may already exist.",
+        ) from error
+
+
+@app.post("/api/admin/courses")
+async def create_course(
+    request: CourseCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO public.courses (
+                        institute_id, course_code, name,
+                        duration_weeks, base_fee
+                    )
+                    VALUES (%s::uuid, %s, %s, %s, %s)
+                    RETURNING id::text, institute_id::text, course_code,
+                              name, duration_weeks, base_fee,
+                              created_at, updated_at
+                    """,
+                    (
+                        user.institute_id,
+                        request.course_code.strip(),
+                        request.name.strip(),
+                        request.duration_weeks,
+                        request.base_fee,
+                    ),
+                )
+                course = cursor.fetchone()
+        return {"course": dict(course)}
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create the course. The code may already exist.",
+        ) from error
+
+
+@app.post("/api/admin/batches")
+async def create_batch(
+    request: BatchCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if request.end_date and request.end_date < request.start_date:
+        raise HTTPException(
+            status_code=422,
+            detail="end_date cannot be earlier than start_date.",
+        )
+    if request.status not in {"ACTIVE", "INACTIVE", "COMPLETED", "CANCELLED"}:
+        raise HTTPException(status_code=422, detail="Invalid batch status.")
+    if request.mode not in {"OFFLINE", "ONLINE", "HYBRID"}:
+        raise HTTPException(status_code=422, detail="Invalid batch mode.")
+
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM public.courses
+                    WHERE id = %s::uuid
+                      AND institute_id = %s::uuid
+                    """,
+                    (request.course_id, user.institute_id),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Course was not found in your institute.",
+                    )
+
+                if request.trainer_id:
+                    cursor.execute(
+                        """
+                        SELECT id
+                        FROM public.trainers
+                        WHERE id = %s::uuid
+                          AND institute_id = %s::uuid
+                          AND is_active = TRUE
+                        """,
+                        (request.trainer_id, user.institute_id),
+                    )
+                    if cursor.fetchone() is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Active trainer was not found in your institute.",
+                        )
+
+                cursor.execute(
+                    """
+                    INSERT INTO public.batches (
+                        institute_id, name, course_id, trainer_id, mode,
+                        room_number, meeting_url, max_classroom_seats,
+                        max_online_seats, start_date, end_date,
+                        schedule_time, status
+                    )
+                    VALUES (
+                        %s::uuid, %s, %s::uuid, %s::uuid, %s::batch_mode,
+                        %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    RETURNING id::text, institute_id::text, name,
+                              course_id::text, trainer_id::text, mode::text,
+                              room_number, meeting_url, max_classroom_seats,
+                              max_online_seats, start_date, end_date,
+                              schedule_time, status, created_at, updated_at
+                    """,
+                    (
+                        user.institute_id,
+                        request.name.strip(),
+                        request.course_id,
+                        request.trainer_id,
+                        request.mode,
+                        request.room_number,
+                        request.meeting_url,
+                        request.max_classroom_seats,
+                        request.max_online_seats,
+                        request.start_date,
+                        request.end_date,
+                        request.schedule_time,
+                        request.status,
+                    ),
+                )
+                batch = cursor.fetchone()
+        return {"batch": dict(batch)}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create the batch. Check the supplied values.",
+        ) from error
 
 
 @app.post("/api/admin/invitations/student")

@@ -26,6 +26,22 @@ def initialize_action_store() -> None:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS public.branches (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    institute_id UUID NOT NULL
+                        REFERENCES public.institutes(id) ON DELETE CASCADE,
+                    name VARCHAR NOT NULL,
+                    address TEXT,
+                    phone VARCHAR,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (institute_id, name)
+                )
+                """
+            )
+            cursor.execute(
+                """
                 CREATE TABLE IF NOT EXISTS staged_actions (
                     id TEXT PRIMARY KEY,
                     action_type TEXT NOT NULL,

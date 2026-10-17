@@ -1,6 +1,9 @@
+import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from auth import (
@@ -21,6 +24,8 @@ from database import initialize_action_store
 from messaging import send_messages
 
 
+load_dotenv()
+
 engine: CopilotEngine | None = None
 
 
@@ -38,15 +43,30 @@ app = FastAPI(
 )
 
 
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
 class ChatRequest(BaseModel):
     message: str
-    user_role: str = "counselor"
-    user_id: str | None = None
 
 
 class ActionDecisionRequest(BaseModel):
-    user_id: str
-    user_role: str
+    pass
 
 
 class AdminSignupRequest(BaseModel):
@@ -145,7 +165,10 @@ async def current_user(
 
 
 @app.post("/api/copilot/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     if engine is None:
         raise HTTPException(
             status_code=503,
@@ -155,8 +178,8 @@ async def chat(request: ChatRequest):
     try:
         return engine.process_prompt(
             user_prompt=request.message,
-            user_role=request.user_role.lower(),
-            user_id=request.user_id,
+            user_role=current_user.role.lower(),
+            user_id=current_user.auth_user_id,
         )
     except HTTPException:
         raise
@@ -172,11 +195,14 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/api/actions/{action_id}/approve")
-async def approve_action(action_id: str, request: ActionDecisionRequest):
-    role = request.user_role.lower()
+async def approve_action(
+    action_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    role = current_user.role.lower()
     action_claimed = False
     try:
-        action = claim_action(action_id, request.user_id, role)
+        action = claim_action(action_id, current_user.auth_user_id, role)
         action_claimed = True
         messages = action["payload"].get("messages", [])
         if not messages or any(not message.get("phone") for message in messages):
@@ -209,12 +235,15 @@ async def approve_action(action_id: str, request: ActionDecisionRequest):
 
 
 @app.post("/api/actions/{action_id}/reject")
-async def reject_staged_action(action_id: str, request: ActionDecisionRequest):
+async def reject_staged_action(
+    action_id: str,
+    current_user: CurrentUser = Depends(get_current_user),
+):
     try:
         reject_action(
             action_id=action_id,
-            user_id=request.user_id,
-            role=request.user_role.lower(),
+            user_id=current_user.auth_user_id,
+            role=current_user.role.lower(),
         )
         return {"action_id": action_id, "status": "REJECTED"}
     except PermissionError as error:

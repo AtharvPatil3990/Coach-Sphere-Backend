@@ -1,6 +1,6 @@
 import os
 from contextlib import asynccontextmanager
-from datetime import date, time
+from datetime import date, datetime, time, timedelta
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
@@ -119,6 +119,60 @@ class BatchCreateRequest(BaseModel):
     end_date: date | None = None
     schedule_time: time
     status: str = "ACTIVE"
+
+
+class ScheduleCreateRequest(BaseModel):
+    branch_id: str
+    batch_id: str
+    trainer_id: str | None = None
+    day_of_week: int = Field(ge=0, le=6)
+    start_time: time
+    end_time: time
+    mode: str
+    room_number: str | None = None
+    meeting_url: str | None = None
+    effective_from: date
+    effective_until: date | None = None
+
+
+class SessionGenerateRequest(BaseModel):
+    from_date: date
+    to_date: date
+    branch_id: str | None = None
+
+
+class SessionSubstitutionRequest(BaseModel):
+    substitute_trainer_id: str
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class TrainerAbsenceRequest(BaseModel):
+    branch_id: str
+    trainer_id: str
+    substitute_trainer_id: str
+    absent_from: date
+    absent_until: date
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class TimetableQuery(BaseModel):
+    from_date: date
+    to_date: date
+
+
+class HolidayCreateRequest(BaseModel):
+    branch_id: str | None = None
+    holiday_date: date
+    name: str = Field(min_length=1, max_length=150)
+
+
+class SessionRescheduleRequest(BaseModel):
+    session_date: date
+    start_time: time
+    end_time: time
+    room_number: str | None = None
+    meeting_url: str | None = None
+    reason: str = Field(min_length=1, max_length=500)
 
 
 def require_admin(user: CurrentUser) -> None:
@@ -313,6 +367,807 @@ async def create_batch(
             status_code=400,
             detail="Unable to create the batch. Check the supplied values.",
         ) from error
+
+
+@app.post("/api/admin/schedules")
+async def create_schedule(
+    request: ScheduleCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if request.end_time <= request.start_time:
+        raise HTTPException(status_code=422, detail="end_time must be later than start_time.")
+    if request.effective_until and request.effective_until < request.effective_from:
+        raise HTTPException(status_code=422, detail="effective_until cannot be earlier than effective_from.")
+    if request.mode not in {"CLASSROOM", "ONLINE"}:
+        raise HTTPException(status_code=422, detail="mode must be CLASSROOM or ONLINE.")
+    if request.mode == "CLASSROOM" and not request.room_number:
+        raise HTTPException(status_code=422, detail="room_number is required for classroom schedules.")
+    if request.mode == "ONLINE" and not request.meeting_url:
+        raise HTTPException(status_code=422, detail="meeting_url is required for online schedules.")
+
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id FROM public.batches
+                    WHERE id = %s::uuid AND institute_id = %s::uuid
+                    """,
+                    (request.batch_id, user.institute_id),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Batch was not found in your institute.")
+
+                if request.branch_id:
+                    cursor.execute(
+                        """
+                        SELECT id FROM public.branches
+                        WHERE id = %s::uuid AND institute_id = %s::uuid
+                          AND is_active = TRUE
+                        """,
+                        (request.branch_id, user.institute_id),
+                    )
+                    if cursor.fetchone() is None:
+                        raise HTTPException(status_code=404, detail="Active branch was not found in your institute.")
+
+                if request.trainer_id:
+                    cursor.execute(
+                        """
+                        SELECT id FROM public.trainers
+                        WHERE id = %s::uuid AND institute_id = %s::uuid
+                          AND is_active = TRUE
+                        """,
+                        (request.trainer_id, user.institute_id),
+                    )
+                    if cursor.fetchone() is None:
+                        raise HTTPException(status_code=404, detail="Active trainer was not found in your institute.")
+
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM public.class_schedules AS s
+                    WHERE s.institute_id = %s::uuid
+                      AND s.day_of_week = %s
+                      AND s.is_active = TRUE
+                      AND (%s IS NULL OR s.effective_from <= %s)
+                      AND (s.effective_until IS NULL OR s.effective_until >= %s)
+                      AND s.start_time < %s
+                      AND s.end_time > %s
+                      AND (
+                          s.batch_id = %s::uuid
+                          OR (%s::uuid IS NOT NULL AND s.trainer_id = %s::uuid)
+                          OR (
+                              %s = 'CLASSROOM'
+                              AND s.branch_id = %s::uuid
+                              AND s.room_number = %s
+                          )
+                      )
+                    LIMIT 1
+                    """,
+                    (
+                        user.institute_id,
+                        request.day_of_week,
+                        request.effective_until,
+                        request.effective_until,
+                        request.effective_from,
+                        request.start_time,
+                        request.end_time,
+                        request.batch_id,
+                        request.trainer_id,
+                        request.trainer_id,
+                        request.mode,
+                        request.branch_id,
+                        request.room_number,
+                    ),
+                )
+                if cursor.fetchone() is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Schedule overlaps an existing batch, trainer, or classroom schedule.",
+                    )
+
+                cursor.execute(
+                    """
+                    INSERT INTO public.class_schedules (
+                        institute_id, branch_id, batch_id, trainer_id,
+                        day_of_week, start_time, end_time, mode,
+                        room_number, meeting_url, effective_from, effective_until
+                    )
+                    VALUES (
+                        %s::uuid, %s::uuid, %s::uuid, %s::uuid,
+                        %s, %s, %s, %s::attendance_mode,
+                        %s, %s, %s, %s
+                    )
+                    RETURNING id::text, institute_id::text, branch_id::text,
+                              batch_id::text, trainer_id::text, day_of_week,
+                              start_time, end_time, mode::text, room_number,
+                              meeting_url, effective_from, effective_until,
+                              is_active, created_at
+                    """,
+                    (
+                        user.institute_id,
+                        request.branch_id,
+                        request.batch_id,
+                        request.trainer_id,
+                        request.day_of_week,
+                        request.start_time,
+                        request.end_time,
+                        request.mode,
+                        request.room_number,
+                        request.meeting_url,
+                        request.effective_from,
+                        request.effective_until,
+                    ),
+                )
+                schedule = cursor.fetchone()
+        return {"schedule": dict(schedule)}
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Unable to create the schedule.") from error
+
+
+@app.post("/api/admin/trainer-absences")
+async def record_trainer_absence(
+    request: TrainerAbsenceRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if request.absent_until < request.absent_from:
+        raise HTTPException(status_code=422, detail="absent_until cannot be earlier than absent_from.")
+    if request.trainer_id == request.substitute_trainer_id:
+        raise HTTPException(status_code=422, detail="The substitute must be a different trainer.")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM public.branches
+                WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                """,
+                (request.branch_id, user.institute_id),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Active branch was not found in your institute.")
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM public.trainers
+                WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                """,
+                (request.trainer_id, user.institute_id),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Absent trainer was not found in your institute.")
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM public.trainers
+                WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                """,
+                (request.substitute_trainer_id, user.institute_id),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Active substitute trainer was not found.")
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM public.trainer_absences
+                WHERE institute_id = %s::uuid
+                  AND branch_id = %s::uuid
+                  AND trainer_id = %s::uuid
+                  AND absent_from <= %s
+                  AND absent_until >= %s
+                LIMIT 1
+                """,
+                (
+                    user.institute_id,
+                    request.branch_id,
+                    request.trainer_id,
+                    request.absent_until,
+                    request.absent_from,
+                ),
+            )
+            if cursor.fetchone() is not None:
+                raise HTTPException(status_code=409, detail="An absence already covers part of this date range.")
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM public.class_sessions AS cs
+                JOIN public.class_schedules AS s ON s.id = cs.schedule_id
+                WHERE cs.institute_id = %s::uuid
+                  AND s.branch_id = %s::uuid
+                  AND cs.trainer_id = %s::uuid
+                  AND cs.session_date BETWEEN %s AND %s
+                  AND cs.status NOT IN ('CANCELLED', 'COMPLETED')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM public.class_sessions AS occupied
+                      WHERE occupied.institute_id = cs.institute_id
+                        AND occupied.id <> cs.id
+                        AND occupied.session_date = cs.session_date
+                        AND occupied.trainer_id = %s::uuid
+                        AND occupied.status NOT IN ('CANCELLED', 'COMPLETED')
+                        AND occupied.start_time < cs.end_time
+                        AND occupied.end_time > cs.start_time
+                  )
+                LIMIT 1
+                """,
+                (
+                    user.institute_id,
+                    request.branch_id,
+                    request.trainer_id,
+                    request.absent_from,
+                    request.absent_until,
+                    request.substitute_trainer_id,
+                ),
+            )
+            if cursor.fetchone() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The substitute trainer has an overlapping class during the absence.",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO public.trainer_absences (
+                    institute_id, branch_id, trainer_id, substitute_trainer_id,
+                    absent_from, absent_until, reason, created_by_user_id
+                )
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s::uuid)
+                RETURNING id::text, branch_id::text, trainer_id::text,
+                          substitute_trainer_id::text, absent_from, absent_until, reason
+                """,
+                (
+                    user.institute_id,
+                    request.branch_id,
+                    request.trainer_id,
+                    request.substitute_trainer_id,
+                    request.absent_from,
+                    request.absent_until,
+                    request.reason,
+                    user.auth_user_id,
+                ),
+            )
+            absence = cursor.fetchone()
+
+            cursor.execute(
+                """
+                UPDATE public.class_sessions AS cs
+                SET trainer_id = %s::uuid,
+                    substitution_reason = %s,
+                    updated_at = NOW()
+                FROM public.class_schedules AS s
+                WHERE cs.schedule_id = s.id
+                  AND cs.institute_id = %s::uuid
+                  AND s.branch_id = %s::uuid
+                  AND cs.original_trainer_id = %s::uuid
+                  AND cs.session_date BETWEEN %s AND %s
+                  AND cs.status NOT IN ('CANCELLED', 'COMPLETED')
+                """,
+                (
+                    request.substitute_trainer_id,
+                    request.reason,
+                    user.institute_id,
+                    request.branch_id,
+                    request.trainer_id,
+                    request.absent_from,
+                    request.absent_until,
+                ),
+            )
+    return {"absence": dict(absence)}
+
+
+@app.get("/api/admin/branches/{branch_id}/timetable")
+async def get_branch_timetable(
+    branch_id: str,
+    from_date: date,
+    to_date: date,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if to_date < from_date:
+        raise HTTPException(status_code=422, detail="to_date cannot be earlier than from_date.")
+    if (to_date - from_date).days > 366:
+        raise HTTPException(status_code=422, detail="Request at most one year of timetable data.")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id::text, name
+                FROM public.branches
+                WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                """,
+                (branch_id, user.institute_id),
+            )
+            branch = cursor.fetchone()
+            if branch is None:
+                raise HTTPException(status_code=404, detail="Active branch was not found in your institute.")
+
+            cursor.execute(
+                """
+                SELECT cs.id::text AS session_id,
+                       cs.session_date,
+                       cs.start_time,
+                       cs.end_time,
+                       cs.mode::text AS mode,
+                       cs.room_number,
+                       cs.meeting_url,
+                       cs.batch_id::text AS batch_id,
+                       b.name AS batch_name,
+                       cs.original_trainer_id::text AS original_trainer_id,
+                       cs.trainer_id::text AS trainer_id,
+                       original_trainer.name AS original_trainer_name,
+                       assigned_trainer.name AS trainer_name,
+                       (cs.original_trainer_id IS DISTINCT FROM cs.trainer_id) AS is_substituted,
+                       cs.substitution_reason,
+                       cs.status
+                FROM public.class_sessions AS cs
+                JOIN public.class_schedules AS s ON s.id = cs.schedule_id
+                JOIN public.batches AS b ON b.id = cs.batch_id
+                LEFT JOIN public.trainers AS original_trainer ON original_trainer.id = cs.original_trainer_id
+                LEFT JOIN public.trainers AS assigned_trainer ON assigned_trainer.id = cs.trainer_id
+                WHERE cs.institute_id = %s::uuid
+                  AND s.branch_id = %s::uuid
+                  AND cs.session_date BETWEEN %s AND %s
+                ORDER BY cs.session_date, cs.start_time, b.name
+                """,
+                (user.institute_id, branch_id, from_date, to_date),
+            )
+            sessions = [dict(row) for row in cursor.fetchall()]
+
+    return {
+        "branch": dict(branch),
+        "from_date": from_date,
+        "to_date": to_date,
+        "timetable": sessions,
+    }
+
+
+@app.get("/api/trainer/timetable")
+async def get_trainer_timetable(
+    from_date: date,
+    to_date: date,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if user.role != "trainer" or not user.trainer_id:
+        raise HTTPException(status_code=403, detail="Only trainers can access this timetable.")
+    if to_date < from_date:
+        raise HTTPException(status_code=422, detail="to_date cannot be earlier than from_date.")
+    if (to_date - from_date).days > 366:
+        raise HTTPException(status_code=422, detail="Request at most one year of timetable data.")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cs.id::text AS session_id, cs.session_date, cs.start_time,
+                       cs.end_time, cs.mode::text AS mode, cs.room_number,
+                       cs.meeting_url, cs.batch_id::text AS batch_id,
+                       b.name AS batch_name, s.branch_id::text AS branch_id,
+                       br.name AS branch_name, cs.trainer_id::text AS trainer_id,
+                       t.name AS trainer_name, cs.status,
+                       (cs.original_trainer_id IS DISTINCT FROM cs.trainer_id) AS is_substituted,
+                       cs.substitution_reason
+                FROM public.class_sessions AS cs
+                JOIN public.class_schedules AS s ON s.id = cs.schedule_id
+                JOIN public.batches AS b ON b.id = cs.batch_id
+                JOIN public.branches AS br ON br.id = s.branch_id
+                LEFT JOIN public.trainers AS t ON t.id = cs.trainer_id
+                WHERE cs.institute_id = %s::uuid
+                  AND cs.trainer_id = %s::uuid
+                  AND cs.session_date BETWEEN %s AND %s
+                ORDER BY cs.session_date, cs.start_time
+                """,
+                (user.institute_id, user.trainer_id, from_date, to_date),
+            )
+            sessions = [dict(row) for row in cursor.fetchall()]
+    return {"from_date": from_date, "to_date": to_date, "timetable": sessions}
+
+
+@app.get("/api/student/timetable")
+async def get_student_timetable(
+    from_date: date,
+    to_date: date,
+    user: CurrentUser = Depends(get_current_user),
+):
+    if user.role != "student" or not user.student_id:
+        raise HTTPException(status_code=403, detail="Only students can access this timetable.")
+    if to_date < from_date:
+        raise HTTPException(status_code=422, detail="to_date cannot be earlier than from_date.")
+    if (to_date - from_date).days > 366:
+        raise HTTPException(status_code=422, detail="Request at most one year of timetable data.")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cs.id::text AS session_id, cs.session_date, cs.start_time,
+                       cs.end_time, cs.mode::text AS mode, cs.room_number,
+                       cs.meeting_url, cs.batch_id::text AS batch_id,
+                       b.name AS batch_name, s.branch_id::text AS branch_id,
+                       br.name AS branch_name, cs.trainer_id::text AS trainer_id,
+                       t.name AS trainer_name, cs.status,
+                       (cs.original_trainer_id IS DISTINCT FROM cs.trainer_id) AS is_substituted,
+                       cs.substitution_reason
+                FROM public.class_sessions AS cs
+                JOIN public.class_schedules AS s ON s.id = cs.schedule_id
+                JOIN public.batches AS b ON b.id = cs.batch_id
+                JOIN public.branches AS br ON br.id = s.branch_id
+                LEFT JOIN public.trainers AS t ON t.id = cs.trainer_id
+                JOIN public.students AS st ON st.batch_id = cs.batch_id
+                WHERE cs.institute_id = %s::uuid
+                  AND st.id = %s::uuid
+                  AND st.institute_id = %s::uuid
+                  AND st.status = 'ACTIVE'
+                  AND cs.session_date BETWEEN %s AND %s
+                ORDER BY cs.session_date, cs.start_time
+                """,
+                (
+                    user.institute_id,
+                    user.student_id,
+                    user.institute_id,
+                    from_date,
+                    to_date,
+                ),
+            )
+            sessions = [dict(row) for row in cursor.fetchall()]
+    return {"from_date": from_date, "to_date": to_date, "timetable": sessions}
+
+
+@app.post("/api/admin/holidays")
+async def create_holiday(
+    request: HolidayCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if request.branch_id:
+                cursor.execute(
+                    """
+                    SELECT id FROM public.branches
+                    WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                    """,
+                    (request.branch_id, user.institute_id),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Active branch was not found in your institute.")
+            cursor.execute(
+                """
+                INSERT INTO public.institute_holidays (
+                    institute_id, branch_id, holiday_date, name, created_by_user_id
+                )
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s::uuid)
+                ON CONFLICT (institute_id, branch_id, holiday_date)
+                DO UPDATE SET name = EXCLUDED.name
+                RETURNING id::text, institute_id::text, branch_id::text,
+                          holiday_date, name, created_at
+                """,
+                (
+                    user.institute_id,
+                    request.branch_id,
+                    request.holiday_date,
+                    request.name.strip(),
+                    user.auth_user_id,
+                ),
+            )
+            holiday = cursor.fetchone()
+    return {"holiday": dict(holiday)}
+
+
+@app.post("/api/admin/class-sessions/generate")
+async def generate_class_sessions(
+    request: SessionGenerateRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if request.to_date < request.from_date:
+        raise HTTPException(status_code=422, detail="to_date cannot be earlier than from_date.")
+    if (request.to_date - request.from_date).days > 366:
+        raise HTTPException(status_code=422, detail="Generate sessions for at most one year.")
+
+    created = 0
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if request.branch_id:
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM public.branches
+                    WHERE id = %s::uuid AND institute_id = %s::uuid AND is_active = TRUE
+                    """,
+                    (request.branch_id, user.institute_id),
+                )
+                if cursor.fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Active branch was not found in your institute.")
+
+            current = request.from_date
+            while current <= request.to_date:
+                cursor.execute(
+                    """
+                    INSERT INTO public.class_sessions (
+                        institute_id, schedule_id, batch_id,
+                        original_trainer_id, trainer_id, session_date,
+                        start_time, end_time, mode, room_number, meeting_url
+                    )
+                    SELECT s.institute_id, s.id, s.batch_id,
+                           s.trainer_id,
+                           COALESCE(ta.substitute_trainer_id, s.trainer_id),
+                           %s,
+                           s.start_time, s.end_time, s.mode,
+                           s.room_number, s.meeting_url
+                    FROM public.class_schedules AS s
+                    LEFT JOIN public.trainer_absences AS ta
+                      ON ta.institute_id = s.institute_id
+                     AND ta.branch_id = s.branch_id
+                     AND ta.trainer_id = s.trainer_id
+                     AND ta.absent_from <= %s
+                     AND ta.absent_until >= %s
+                    JOIN public.batches AS b ON b.id = s.batch_id
+                    WHERE s.institute_id = %s::uuid
+                      AND (%s::uuid IS NULL OR s.branch_id = %s::uuid)
+                      AND s.is_active = TRUE
+                      AND s.day_of_week = EXTRACT(DOW FROM %s::date)
+                      AND s.effective_from <= %s
+                      AND (s.effective_until IS NULL OR s.effective_until >= %s)
+                      AND b.start_date <= %s
+                      AND (b.end_date IS NULL OR b.end_date >= %s)
+                      AND b.status = 'ACTIVE'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM public.institute_holidays AS h
+                          WHERE h.institute_id = s.institute_id
+                            AND h.holiday_date = %s
+                            AND (h.branch_id IS NULL OR h.branch_id = s.branch_id)
+                      )
+                    ON CONFLICT (schedule_id, session_date, start_time) DO NOTHING
+                    """,
+                    (
+                        current,
+                        current,
+                        current,
+                        user.institute_id,
+                        request.branch_id,
+                        request.branch_id,
+                        current,
+                        current,
+                        current,
+                        current,
+                        current,
+                        current,
+                    ),
+                )
+                created += cursor.rowcount
+                current += timedelta(days=1)
+    return {"created_sessions": created}
+
+
+@app.post("/api/admin/class-sessions/{session_id}/substitute")
+async def substitute_trainer(
+    session_id: str,
+    request: SessionSubstitutionRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, batch_id, session_date, start_time, end_time,
+                       room_number, trainer_id, status
+                FROM public.class_sessions
+                WHERE id = %s::uuid AND institute_id = %s::uuid
+                FOR UPDATE
+                """,
+                (session_id, user.institute_id),
+            )
+            session = cursor.fetchone()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Class session was not found.")
+            if session["status"] in {"COMPLETED", "CANCELLED"}:
+                raise HTTPException(status_code=409, detail="This session cannot be reassigned.")
+
+            cursor.execute(
+                """
+                SELECT id FROM public.trainers
+                WHERE id = %s::uuid AND institute_id = %s::uuid
+                  AND is_active = TRUE
+                """,
+                (request.substitute_trainer_id, user.institute_id),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Active substitute trainer was not found.")
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM public.class_sessions AS cs
+                WHERE cs.institute_id = %s::uuid
+                  AND cs.id <> %s::uuid
+                  AND cs.session_date = %s
+                  AND cs.status NOT IN ('CANCELLED', 'COMPLETED')
+                  AND cs.start_time < %s
+                  AND cs.end_time > %s
+                  AND (
+                      cs.trainer_id = %s::uuid
+                      OR (
+                          cs.room_number IS NOT NULL
+                          AND cs.room_number = %s
+                          AND cs.batch_id <> %s::uuid
+                      )
+                  )
+                LIMIT 1
+                """,
+                (
+                    user.institute_id,
+                    session_id,
+                    session["session_date"],
+                    session["end_time"],
+                    session["start_time"],
+                    request.substitute_trainer_id,
+                    session["room_number"],
+                    session["batch_id"],
+                ),
+            )
+            if cursor.fetchone() is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The substitute trainer or classroom has an overlapping session.",
+                )
+
+            cursor.execute(
+                """
+                UPDATE public.class_sessions
+                SET original_trainer_id = COALESCE(original_trainer_id, trainer_id),
+                    trainer_id = %s::uuid,
+                    substitution_reason = %s,
+                    updated_at = NOW()
+                WHERE id = %s::uuid AND institute_id = %s::uuid
+                RETURNING id::text, batch_id::text, session_date,
+                          start_time, end_time, trainer_id::text,
+                          original_trainer_id::text, substitution_reason, status
+                """,
+                (
+                    request.substitute_trainer_id,
+                    request.reason,
+                    session_id,
+                    user.institute_id,
+                ),
+            )
+            updated = cursor.fetchone()
+    return {"session": dict(updated)}
+
+
+@app.patch("/api/admin/class-sessions/{session_id}/cancel")
+async def cancel_class_session(
+    session_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE public.class_sessions
+                SET status = 'CANCELLED', updated_at = NOW()
+                WHERE id = %s::uuid
+                  AND institute_id = %s::uuid
+                  AND status NOT IN ('COMPLETED', 'CANCELLED')
+                RETURNING id::text, session_date, status
+                """,
+                (session_id, user.institute_id),
+            )
+            session = cursor.fetchone()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Active class session was not found.")
+    return {"session": dict(session)}
+
+
+@app.patch("/api/admin/class-sessions/{session_id}/reschedule")
+async def reschedule_class_session(
+    session_id: str,
+    request: SessionRescheduleRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
+    require_admin(user)
+    if request.end_time <= request.start_time:
+        raise HTTPException(status_code=422, detail="end_time must be later than start_time.")
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT cs.id, cs.batch_id, cs.trainer_id, cs.mode, cs.room_number,
+                       s.branch_id
+                FROM public.class_sessions AS cs
+                JOIN public.class_schedules AS s ON s.id = cs.schedule_id
+                WHERE cs.id = %s::uuid AND cs.institute_id = %s::uuid
+                FOR UPDATE
+                """,
+                (session_id, user.institute_id),
+            )
+            session = cursor.fetchone()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Class session was not found.")
+            if session["status"] in {"COMPLETED", "CANCELLED"}:
+                raise HTTPException(status_code=409, detail="This session cannot be rescheduled.")
+            if session["mode"] == "CLASSROOM" and not request.room_number:
+                raise HTTPException(status_code=422, detail="room_number is required for classroom sessions.")
+            if session["mode"] == "ONLINE" and not request.meeting_url:
+                raise HTTPException(status_code=422, detail="meeting_url is required for online sessions.")
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM public.class_sessions AS other
+                JOIN public.class_schedules AS os ON os.id = other.schedule_id
+                WHERE other.institute_id = %s::uuid
+                  AND other.id <> %s::uuid
+                  AND other.session_date = %s
+                  AND other.status NOT IN ('CANCELLED', 'COMPLETED')
+                  AND other.start_time < %s
+                  AND other.end_time > %s
+                  AND (
+                      other.batch_id = %s::uuid
+                      OR other.trainer_id = %s::uuid
+                      OR (
+                          %s = 'CLASSROOM'
+                          AND os.branch_id = %s::uuid
+                          AND other.room_number = %s
+                      )
+                  )
+                LIMIT 1
+                """,
+                (
+                    user.institute_id,
+                    session_id,
+                    request.session_date,
+                    request.end_time,
+                    request.start_time,
+                    session["batch_id"],
+                    session["trainer_id"],
+                    session["mode"],
+                    session["branch_id"],
+                    request.room_number,
+                ),
+            )
+            if cursor.fetchone() is not None:
+                raise HTTPException(status_code=409, detail="The rescheduled session overlaps another class.")
+
+            cursor.execute(
+                """
+                UPDATE public.class_sessions
+                SET session_date = %s, start_time = %s, end_time = %s,
+                    room_number = %s, meeting_url = %s, status = 'RESCHEDULED',
+                    substitution_reason = COALESCE(substitution_reason, '') ||
+                        CASE WHEN COALESCE(substitution_reason, '') = '' THEN %s ELSE %s END,
+                    updated_at = NOW()
+                WHERE id = %s::uuid AND institute_id = %s::uuid
+                RETURNING id::text, session_date, start_time, end_time,
+                          room_number, meeting_url, status, substitution_reason
+                """,
+                (
+                    request.session_date,
+                    request.start_time,
+                    request.end_time,
+                    request.room_number,
+                    request.meeting_url,
+                    request.reason,
+                    " | " + request.reason,
+                    session_id,
+                    user.institute_id,
+                ),
+            )
+            updated = cursor.fetchone()
+    return {"session": dict(updated)}
 
 
 @app.post("/api/admin/invitations/student")

@@ -158,6 +158,7 @@ async def current_user(
         "auth_user_id": user.auth_user_id,
         "email": user.email,
         "institute_id": user.institute_id,
+        "institute_name": user.institute_name,
         "role": user.role,
         "student_id": user.student_id,
         "trainer_id": user.trainer_id,
@@ -180,6 +181,9 @@ async def chat(
             user_prompt=request.message,
             user_role=current_user.role.lower(),
             user_id=current_user.auth_user_id,
+            institute_id=current_user.institute_id,
+            student_id=current_user.student_id,
+            trainer_id=current_user.trainer_id,
         )
     except HTTPException:
         raise

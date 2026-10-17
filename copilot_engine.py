@@ -3,6 +3,7 @@ import re
 import os
 from datetime import date
 from typing import Optional
+from uuid import UUID
 
 import sqlglot
 from sqlglot import exp
@@ -26,37 +27,37 @@ def render_template(template, context):
     return re.sub(r"\{(\w+)\}", replace, template)
 
 SCHEMA_DESCRIPTIONS = {
-    "trainers": "trainers(id, name, email, phone, expertise, is_active, created_at)",
-    "courses": "courses(id, course_code, name, duration_weeks, base_fee)",
-    "batches": "batches(id, name, course_id, trainer_id, mode, room_number, meeting_url, max_classroom_seats, max_online_seats, start_date, end_date, schedule_time, status)",
-    "students": "students(id, name, email, phone, batch_id, enrollment_date, status)",
-    "attendance": "attendance(id, student_id, batch_id, session_date, mode, check_in_time, check_out_time, online_join_duration_mins, status)",
-    "fees": "fees(id, student_id, batch_id, total_payable, discount_applied, created_at)",
-    "emi_installments": "emi_installments(id, fee_id, student_id, installment_number, amount_due, due_date, status, reminder_count, last_reminder_sent_at, paid_date, transaction_ref)",
-    "class_recordings": "class_recordings(id, batch_id, trainer_id, session_date, topic_covered, video_url, duration_minutes, created_at)",
+    "trainers": "trainers(id, institute_id, name, email, phone, expertise, is_active, created_at)",
+    "courses": "courses(id, institute_id, course_code, name, duration_weeks, base_fee)",
+    "batches": "batches(id, institute_id, name, course_id, trainer_id, mode, room_number, meeting_url, max_classroom_seats, max_online_seats, start_date, end_date, schedule_time, status)",
+    "students": "students(id, institute_id, name, email, phone, batch_id, enrollment_date, status)",
+    "attendance": "attendance(id, institute_id, student_id, batch_id, session_date, mode, check_in_time, check_out_time, online_join_duration_mins, status)",
+    "fees": "fees(id, institute_id, student_id, batch_id, total_payable, discount_applied, created_at)",
+    "emi_installments": "emi_installments(id, institute_id, fee_id, student_id, installment_number, amount_due, due_date, status, last_reminder_sent_at, paid_date, transaction_ref)",
+    "class_recordings": "class_recordings(id, institute_id, batch_id, trainer_id, session_date, topic_covered, video_url, duration_minutes, created_at)",
 }
 
 TABLE_COLUMNS = {
-    "trainers": {"id", "name", "email", "phone", "expertise", "is_active", "created_at"},
-    "courses": {"id", "course_code", "name", "duration_weeks", "base_fee"},
+    "trainers": {"id", "institute_id", "name", "email", "phone", "expertise", "is_active", "created_at"},
+    "courses": {"id", "institute_id", "course_code", "name", "duration_weeks", "base_fee"},
     "batches": {
-        "id", "name", "course_id", "trainer_id", "mode", "room_number",
+        "id", "institute_id", "name", "course_id", "trainer_id", "mode", "room_number",
         "meeting_url", "max_classroom_seats", "max_online_seats",
         "start_date", "end_date", "schedule_time", "status", "created_at",
     },
-    "students": {"id", "name", "email", "phone", "batch_id", "enrollment_date", "status"},
+    "students": {"id", "institute_id", "name", "email", "phone", "batch_id", "enrollment_date", "status"},
     "attendance": {
-        "id", "student_id", "batch_id", "session_date", "mode",
+        "id", "institute_id", "student_id", "batch_id", "session_date", "mode",
         "check_in_time", "check_out_time", "online_join_duration_mins", "status",
     },
-    "fees": {"id", "student_id", "batch_id", "total_payable", "discount_applied", "created_at"},
+    "fees": {"id", "institute_id", "student_id", "batch_id", "total_payable", "discount_applied", "created_at"},
     "emi_installments": {
-        "id", "fee_id", "student_id", "installment_number", "amount_due",
+        "id", "institute_id", "fee_id", "student_id", "installment_number", "amount_due",
         "due_date", "status", "reminder_count", "last_reminder_sent_at",
         "paid_date", "transaction_ref",
     },
     "class_recordings": {
-        "id", "batch_id", "trainer_id", "session_date", "topic_covered",
+        "id", "institute_id", "batch_id", "trainer_id", "session_date", "topic_covered",
         "video_url", "duration_minutes", "created_at",
     },
 }
@@ -65,10 +66,12 @@ _ACADEMIC = ["courses", "batches", "students", "attendance", "class_recordings"]
 _FEE = ["fees", "emi_installments"]
 
 ROLE_PERMISSIONS = {
+    "admin": ["trainers"] + _ACADEMIC + _FEE,
     "owner": ["trainers"] + _ACADEMIC + _FEE,
     "counselor": ["trainers"] + _ACADEMIC + _FEE,
     "accounts": ["students", "courses", "batches"] + _FEE,
     "trainer": ["trainers"] + _ACADEMIC,
+    "student": ["batches", "attendance", "class_recordings"],
 }
 
 # Column-level denies, matched by column name wherever it appears in the query.
@@ -169,8 +172,95 @@ class CopilotEngine:
             parsed = parsed.limit(MAX_ROWS)
         return parsed.sql(dialect="postgres", pretty=True)   # run the re-generated AST, not the raw string
 
+    def apply_user_scope(
+        self,
+        sql: str,
+        role: str,
+        institute_id: str,
+        student_id: str | None = None,
+        trainer_id: str | None = None,
+    ) -> str:
+        try:
+            institute_uuid = str(UUID(institute_id))
+            student_uuid = str(UUID(student_id)) if student_id else None
+            trainer_uuid = str(UUID(trainer_id)) if trainer_id else None
+            parsed = sqlglot.parse_one(sql, read="postgres")
+        except (ValueError, sqlglot.errors.ParseError) as error:
+            raise PermissionError("Invalid authenticated scope or SQL.") from error
+
+        if parsed.find(exp.Subquery):
+            raise PermissionError(
+                "Security Guardrail: subqueries are not supported for scoped queries."
+            )
+
+        tables = [
+            table for table in parsed.find_all(exp.Table)
+            if table.name.lower() in TABLE_COLUMNS
+        ]
+        if not tables:
+            raise PermissionError("Security Guardrail: no institute-scoped table found.")
+
+        predicates = []
+        for table in tables:
+            table_name = table.name.lower()
+            qualifier = table.alias_or_name
+            predicates.append(
+                sqlglot.parse_one(
+                    f"{qualifier}.institute_id = '{institute_uuid}'",
+                    read="postgres",
+                )
+            )
+
+            if role == "student":
+                if not student_uuid:
+                    raise PermissionError("Student membership is incomplete.")
+                if table_name == "attendance":
+                    predicates.append(sqlglot.parse_one(
+                        f"{qualifier}.student_id = '{student_uuid}'",
+                        read="postgres",
+                    ))
+                elif table_name in {"batches", "class_recordings"}:
+                    predicates.append(sqlglot.parse_one(
+                        f"{qualifier}.id IN (SELECT batch_id FROM public.students WHERE id = '{student_uuid}')"
+                        if table_name == "batches"
+                        else f"{qualifier}.batch_id IN (SELECT batch_id FROM public.students WHERE id = '{student_uuid}')",
+                        read="postgres",
+                    ))
+
+            if role == "trainer":
+                if not trainer_uuid:
+                    raise PermissionError("Trainer membership is incomplete.")
+                if table_name == "trainers":
+                    predicates.append(sqlglot.parse_one(
+                        f"{qualifier}.id = '{trainer_uuid}'",
+                        read="postgres",
+                    ))
+                elif table_name in {"batches", "class_recordings"}:
+                    predicates.append(sqlglot.parse_one(
+                        f"{qualifier}.trainer_id = '{trainer_uuid}'",
+                        read="postgres",
+                    ))
+                elif table_name in {"students", "attendance"}:
+                    predicates.append(sqlglot.parse_one(
+                        f"{qualifier}.batch_id IN (SELECT id FROM public.batches WHERE trainer_id = '{trainer_uuid}')",
+                        read="postgres",
+                    ))
+
+        scope = predicates[0]
+        for predicate in predicates[1:]:
+            scope = exp.And(this=scope, expression=predicate)
+        return parsed.where(scope).sql(dialect="postgres", pretty=True)
+
     # ------------------------------------------------------------------ main flow
-    def process_prompt(self, user_prompt: str, user_role: str, user_id: Optional[str] = None):
+    def process_prompt(
+        self,
+        user_prompt: str,
+        user_role: str,
+        user_id: Optional[str] = None,
+        institute_id: str | None = None,
+        student_id: str | None = None,
+        trainer_id: str | None = None,
+    ):
         if user_role not in ROLE_PERMISSIONS:
             raise PermissionError(f"Unknown role '{user_role}'.")
         
@@ -180,6 +270,15 @@ class CopilotEngine:
 
         try:
             sql = self.validate_sql(plan.sql_query, user_role)
+            if not institute_id:
+                raise PermissionError("Authenticated institute scope is required.")
+            sql = self.apply_user_scope(
+                sql,
+                user_role,
+                institute_id,
+                student_id,
+                trainer_id,
+            )
         except PermissionError as e:
             log_event("QUERY_DENIED", user_id, user_role, {"prompt": user_prompt, "sql": plan.sql_query, "reason": str(e)})
             raise

@@ -46,6 +46,7 @@ class CurrentUser:
     auth_user_id: str
     email: str | None
     institute_id: str
+    institute_name: str
     role: str
     student_id: str | None
     trainer_id: str | None
@@ -413,21 +414,28 @@ def get_supabase_user(access_token: str):
         ) from error
 
 
-def load_user_membership(auth_user_id: str) -> CurrentUser:
+def load_user_membership(
+    auth_user_id: str,
+    email: str | None = None,
+) -> CurrentUser:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT
-                    auth_user_id::text,
-                    institute_id::text,
-                    LOWER(role::text) AS role,
-                    student_id::text,
-                    trainer_id::text
-                FROM public.institute_members
-                WHERE auth_user_id = %s::uuid
-                  AND is_active = TRUE
-                ORDER BY created_at
+                    im.auth_user_id::text,
+                    im.institute_id::text,
+                    i.name AS institute_name,
+                    LOWER(im.role::text) AS role,
+                    im.student_id::text,
+                    im.trainer_id::text
+                FROM public.institute_members AS im
+                JOIN public.institutes AS i
+                  ON i.id = im.institute_id
+                WHERE im.auth_user_id = %s::uuid
+                  AND im.is_active = TRUE
+                  AND i.is_active = TRUE
+                ORDER BY im.created_at
                 LIMIT 1
                 """,
                 (auth_user_id,),
@@ -443,8 +451,9 @@ def load_user_membership(auth_user_id: str) -> CurrentUser:
 
     return CurrentUser(
         auth_user_id=membership["auth_user_id"],
-        email=None,
+        email=email,
         institute_id=membership["institute_id"],
+        institute_name=membership["institute_name"],
         role=membership["role"],
         student_id=membership["student_id"],
         trainer_id=membership["trainer_id"],
@@ -472,4 +481,7 @@ def get_current_user(
 
     supabase_user = get_supabase_user(credentials.credentials)
 
-    return load_user_membership(str(supabase_user.id))
+    return load_user_membership(
+        str(supabase_user.id),
+        email=supabase_user.email,
+    )
